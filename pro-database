@@ -1,0 +1,943 @@
+<?php
+/*
+Plugin Name: TheraConnect Pros (Mirror Client UI + Verify + Required WP Account + No JSON)
+Description: Professional registration to custom Users table + required email/password + email verification (blocks WP login until verified) + resend verify (login + public) + full-page POST (no JSON) + safe duplicate-email handling. UI mirrors Client. Adds DB tables, Admin dashboard list/search/export, and a WP Dashboard snapshot widget.
+Version: 2.31
+Author: You
+*/
+
+if (!defined('ABSPATH')) exit;
+
+/* ==============================
+ * Constants (Pros)
+ * ============================== */
+if (!defined('TC_USERS_TABLE')) define('TC_USERS_TABLE', 'Users');
+
+// Redirect after successful submission
+if (!defined('TC_PRO_SUCCESS_REDIRECT')) define('TC_PRO_SUCCESS_REDIRECT', 'https://theraconnect.net/package-plans/');
+
+// Where Pro verification links land (login hub)
+if (!defined('TC_PRO_LOGIN_PAGE')) define('TC_PRO_LOGIN_PAGE', 'https://theraconnect.net/health-practitioners-and-clients-log-in/');
+
+/** Safe helper to get the Pros verify table name (avoids using $GLOBALS['wpdb'] at file load) */
+function tc_pro_verify_table() {
+  global $wpdb;
+  $prefix = isset($wpdb->prefix) ? $wpdb->prefix : 'wp_';
+  return $prefix . 'tc_email_verify_pro';
+}
+
+/* ==============================
+ * Helpers
+ * ============================== */
+if (!function_exists('tc_null_if_empty')) {
+  function tc_null_if_empty($v) {
+    $v = is_string($v) ? trim($v) : $v;
+    return ($v === '' || $v === null) ? null : $v;
+  }
+}
+
+function tc_pro_norm_visit($raw) {
+  $raw = strtolower(trim($raw ?? ''));
+  if ($raw === 'virtual') return 'Telemed';
+  if ($raw === 'in-person' || $raw === 'in person') return 'In-Person';
+  if ($raw === 'either') return 'Telemed/In-Person';
+  return '';
+}
+
+/* ==============================
+ * Mail helpers (scoped to this plugin)
+ * ============================== */
+function tc_pro_default_headers() {
+  return [
+    'From: TheraConnect <admin@theraconnect.net>',
+    'Reply-To: admin@theraconnect.net',
+    'Content-Type: text/plain; charset=UTF-8',
+  ];
+}
+function tc_pro_send_mail($to, $subject, $body, $headers = null) {
+  if ($headers === null) $headers = tc_pro_default_headers();
+  return wp_mail($to, $subject, $body, $headers);
+}
+
+/* ==============================
+ * Activation: ensure DB tables exist
+ * ============================== */
+register_activation_hook(__FILE__, function () {
+  global $wpdb;
+  require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+  $charset = $wpdb->get_charset_collate();
+
+  // 1) Pros verification table
+  $verify_tbl = tc_pro_verify_table();
+  $sql_verify = "CREATE TABLE IF NOT EXISTS `$verify_tbl` (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    ProfessionalID BIGINT UNSIGNED NOT NULL,
+    Token VARCHAR(64) NOT NULL,
+    Verified TINYINT(1) NOT NULL DEFAULT 0,
+    CreatedAt TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    UNIQUE KEY uniq_pro (ProfessionalID),
+    KEY idx_token (Token),
+    KEY idx_verified (Verified),
+    KEY idx_created (CreatedAt)
+  ) $charset;";
+  dbDelta($sql_verify);
+
+  // 2) Main Users table used by your forms
+  $users_tbl = TC_USERS_TABLE;
+  $sql_users = "CREATE TABLE IF NOT EXISTS `$users_tbl` (
+    UserID BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    UserType VARCHAR(32) NOT NULL,                    -- 'Professional' or 'Visitor'
+    CompanyName VARCHAR(255) NULL,
+    DBA VARCHAR(255) NULL,
+    FirstName VARCHAR(120) NOT NULL,
+    LastName VARCHAR(120) NOT NULL,
+    Title VARCHAR(255) NULL,
+    NPI VARCHAR(32) NULL,
+    MobilePhone VARCHAR(64) NULL,
+    Phone VARCHAR(64) NULL,
+    Email VARCHAR(190) NOT NULL,                      -- 190 for utf8mb4 index safety
+    Street VARCHAR(255) NULL,
+    City VARCHAR(120) NULL,
+    StateProvince VARCHAR(120) NULL,
+    PostalZipCode VARCHAR(32) NULL,
+    Country VARCHAR(120) NULL,
+    PreferredVisitType VARCHAR(32) NULL,              -- Telemed / In-Person / Telemed/In-Person
+    InsuranceRequired TINYINT(1) NULL,                -- 1 yes, 0 no, NULL unknown
+    CreatedAt TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UpdatedAt TIMESTAMP NULL DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (UserID),
+    UNIQUE KEY uniq_email (Email),
+    KEY idx_usertype (UserType),
+    KEY idx_lastname (LastName),
+    KEY idx_created (CreatedAt)
+  ) $charset;";
+  dbDelta($sql_users);
+});
+
+/* ==============================
+ * Full-page POST handler (no JSON)
+ * ============================== */
+function tc_handle_pro_submission() {
+  if ($_SERVER['REQUEST_METHOD'] !== 'POST') return;
+  if (!isset($_POST['_wpnonce']) || !wp_verify_nonce($_POST['_wpnonce'], 'save_professional_nonce')) {
+    wp_die('Bad nonce');
+  }
+
+  // Normalize + sanitize
+  $company   = sanitize_text_field($_POST['companyName'] ?? '');
+  $dba       = sanitize_text_field($_POST['dba'] ?? '');
+  $first     = sanitize_text_field($_POST['firstName'] ?? '');
+  $last      = sanitize_text_field($_POST['lastName'] ?? '');
+  $title     = sanitize_text_field($_POST['title'] ?? '');
+  $npi       = sanitize_text_field($_POST['npi'] ?? '');
+  $mobile    = sanitize_text_field($_POST['mobilePhone'] ?? '');
+  $phone     = sanitize_text_field($_POST['phone'] ?? '');
+  $email     = tc_null_if_empty(sanitize_email($_POST['email'] ?? ''));
+  $street    = sanitize_text_field($_POST['street'] ?? '');
+  $city      = sanitize_text_field($_POST['city'] ?? '');
+  $state     = sanitize_text_field($_POST['state'] ?? '');
+  $zip       = sanitize_text_field($_POST['zip'] ?? '');
+  $country   = sanitize_text_field($_POST['country'] ?? '');
+
+  $visitRaw  = $_POST['visitType'] ?? '';
+  $visit     = tc_pro_norm_visit($visitRaw);
+
+  $ins_val   = $_POST['insuranceRequired'] ?? '';
+  $ins_req   = ($ins_val === 'Yes') ? 1 : (($ins_val === 'No') ? 0 : null);
+
+  // Password (with confirm)
+  $pass      = (string)($_POST['pro_password'] ?? '');
+  $pass2     = (string)($_POST['pro_password_confirm'] ?? '');
+
+  // Consent (required, mirrors Clients)
+  $consent   = ($_POST['consent'] ?? '') === 'Yes';
+
+  // Validation
+  $errors = [];
+  if (!$first) $errors[] = 'First Name is required.';
+  if (!$last)  $errors[] = 'Last Name is required.';
+  if (!$email || !is_email($email)) $errors[] = 'A valid Email Address is required.';
+  if (!$pass || strlen($pass) < 8) $errors[] = 'Password must be at least 8 characters.';
+  if ($pass2 !== '' && $pass !== $pass2) $errors[] = 'Passwords do not match.';
+  if (!in_array(strtolower($visitRaw), ['virtual','in-person','either'], true)) $errors[] = 'Please select Preferred Type of Visit.';
+  if (!$consent) $errors[] = 'Please consent to share your info.';
+
+  if (!empty($errors)) wp_die(implode('<br>', array_map('esc_html', $errors)));
+
+  global $wpdb;
+
+  /* 1) Insert/Upsert Professional in custom Users table */
+  $users_tbl = TC_USERS_TABLE;
+
+  $pro_row = [
+    'UserType'           => 'Professional',
+    'CompanyName'        => $company ?: null,
+    'DBA'                => $dba ?: null,
+    'FirstName'          => $first,
+    'LastName'           => $last,
+    'Title'              => $title ?: null,
+    'NPI'                => $npi ?: null,
+    'MobilePhone'        => $mobile,
+    'Phone'              => $phone,
+    'Email'              => $email,
+    'Street'             => $street,
+    'City'               => $city,
+    'StateProvince'      => $state,
+    'PostalZipCode'      => $zip,
+    'Country'            => $country,
+    'PreferredVisitType' => $visit,
+    'InsuranceRequired'  => $ins_req,
+  ];
+
+  $fmt = [
+    '%s','%s','%s','%s','%s','%s','%s',
+    '%s','%s','%s','%s','%s','%s','%s',
+    '%s','%s','%d'
+  ];
+
+  $ok = $wpdb->insert($users_tbl, $pro_row, $fmt);
+
+  if ($ok) {
+    $pro_id = (int)$wpdb->insert_id;
+  } else {
+    $err = $wpdb->last_error;
+    if (strpos($err, 'Duplicate entry') !== false && strpos($err, "for key 'Email'") !== false) {
+      // Reuse latest matching email row
+      $pro_id = (int)$wpdb->get_var($wpdb->prepare(
+        "SELECT UserID FROM `$users_tbl` WHERE Email=%s AND UserType='Professional' ORDER BY UserID DESC LIMIT 1", $email
+      ));
+      if ($pro_id) {
+        $wpdb->update($users_tbl, $pro_row, ['UserID' => $pro_id], $fmt, ['%d']);
+      } else {
+        // If exists as a different UserType, reuse that row ID (if allowed)
+        $pro_id = (int)$wpdb->get_var($wpdb->prepare(
+          "SELECT UserID FROM `$users_tbl` WHERE Email=%s ORDER BY UserID DESC LIMIT 1", $email
+        ));
+        if ($pro_id) {
+          $wpdb->update($users_tbl, $pro_row, ['UserID' => $pro_id], $fmt, ['%d']);
+        } else {
+          wp_die('DB error (Users duplicate): ' . esc_html($err));
+        }
+      }
+    } else {
+      wp_die('DB error (Users): ' . esc_html($err));
+    }
+  }
+
+  /* 2) Create/Link WP user */
+  $existing_uid = email_exists($email);
+  if ($existing_uid) {
+    update_user_meta($existing_uid, 'tc_linked_professional_id', $pro_id);
+  } else {
+    $username = sanitize_user(current(explode('@', $email)));
+    if (username_exists($username)) $username .= '_' . wp_generate_password(4, false);
+    $uid = wp_create_user($username, $pass, $email);
+    if (is_wp_error($uid)) {
+      error_log('TC Pros: wp_create_user error: ' . $uid->get_error_message());
+    } else {
+      wp_update_user(['ID' => $uid, 'first_name' => $first, 'last_name' => $last, 'role' => 'subscriber']);
+      update_user_meta($uid, 'tc_linked_professional_id', $pro_id);
+      update_user_meta($uid, 'tc_email_verified', 0);
+    }
+  }
+
+  /* 3) Upsert verification token (Pros) + email */
+  $verify_tbl = tc_pro_verify_table();
+  $token = wp_generate_password(32, false);
+  $wpdb->replace($verify_tbl, [
+    'ProfessionalID' => $pro_id,
+    'Token'          => $token,
+    'Verified'       => 0,
+  ], ['%d','%s','%d']);
+
+  tc_send_pro_verify_email($email, ($first ?: $email), $pro_id, $token);
+
+  /* 4) Hard redirect to Packages (no JSON shown) */
+  wp_safe_redirect( TC_PRO_SUCCESS_REDIRECT );
+  exit;
+}
+
+/* ==============================
+ * Email helper (Pros)
+ * ============================== */
+function tc_send_pro_verify_email($email, $first, $pro_id, $token) {
+  $verify_url = add_query_arg([
+    'tc_verify_pro' => '1',
+    'pid'           => $pro_id,
+    'token'         => $token,
+  ], TC_PRO_LOGIN_PAGE);
+
+  $site  = wp_specialchars_decode(get_bloginfo('name'), ENT_QUOTES);
+  $subj  = "Thank you for joining $site";
+  $body  = "Hi $first,\n\n"
+         . "Thank you for joining $site!\n\n"
+         . "Please confirm your email by clicking the link below:\n"
+         . $verify_url . "\n\n"
+         . "If you didn’t submit this, you can ignore this email.";
+
+  tc_pro_send_mail($email, $subj, $body);
+}
+
+/* ==============================
+ * Public resend (parity with Clients)
+ * ============================== */
+function tc_pro_public_resend_verify($email_raw) {
+  global $wpdb;
+  $email = sanitize_email($email_raw);
+  if (!$email || !is_email($email)) return ['ok'=>false,'msg'=>'Please enter a valid email address.'];
+
+  // Rate limit (10 min)
+  $key = 'tc_pro_resend_public_' . md5(strtolower($email));
+  if (get_transient($key)) return ['ok'=>false,'msg'=>'Please wait a few minutes before requesting another email.'];
+  set_transient($key, 1, 10 * MINUTE_IN_SECONDS);
+
+  // Find ProfessionalID
+  $pro_id = (int)$wpdb->get_var($wpdb->prepare(
+    "SELECT UserID FROM ".TC_USERS_TABLE." WHERE Email=%s AND UserType='Professional' ORDER BY UserID DESC LIMIT 1", $email
+  ));
+
+  // Fallback via linked WP user
+  if (!$pro_id) {
+    $wp_user = get_user_by('email', $email);
+    if ($wp_user) $pro_id = (int) get_user_meta($wp_user->ID, 'tc_linked_professional_id', true);
+  }
+
+  if (!$pro_id) return ['ok'=>false,'msg'=>'We could not find a professional registration with that email.'];
+
+  // Fresh token + send
+  $verify_tbl = tc_pro_verify_table();
+  $token = wp_generate_password(32, false);
+  $wpdb->replace($verify_tbl, [
+    'ProfessionalID' => $pro_id,
+    'Token'          => $token,
+    'Verified'       => 0,
+  ], ['%d','%s','%d']);
+
+  $first = $wpdb->get_var($wpdb->prepare("SELECT FirstName FROM ".TC_USERS_TABLE." WHERE UserID=%d", $pro_id)) ?: '';
+  tc_send_pro_verify_email($email, $first ?: $email, $pro_id, $token);
+
+  return ['ok'=>true,'msg'=>'We’ve sent a new verification link to your email.'];
+}
+
+/* ==============================
+ * Routing: submit + verify + login resend + public resend
+ * ============================== */
+add_action('template_redirect', function () {
+  // Full-page submission endpoint
+  if (isset($_GET['tc_pro_submit'])) {
+    tc_handle_pro_submission();
+    return;
+  }
+
+  // Public resend (POST)
+  if (isset($_GET['tc_resend_pro_public']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    $nonce = $_POST['_wpnonce'] ?? '';
+    if (!wp_verify_nonce($nonce, 'tc_pro_public_resend')) wp_die('Invalid request.');
+
+    $res = tc_pro_public_resend_verify($_POST['resend_email'] ?? '');
+    status_header(200);
+    ?>
+    <!doctype html>
+    <html <?php language_attributes(); ?>>
+    <head>
+      <meta charset="<?php bloginfo('charset'); ?>">
+      <meta name="viewport" content="width=device-width, initial-scale=1" />
+      <title><?php echo $res['ok'] ? 'Verification Email Sent' : 'Resend Failed'; ?></title>
+      <?php wp_head(); ?>
+      <style>
+        .tc-verify-wrap{max-width:640px;margin:8rem auto;padding:2rem;border-radius:14px;background:#fff;box-shadow:0 10px 30px rgba(0,0,0,.08);font-family:system-ui,-apple-system,Segoe UI,Roboto}
+        .tc-ok{color:#136f35}.tc-bad{color:#b71c1c}
+        .tc-actions{display:flex;gap:.6rem;flex-wrap:wrap;margin-top:8px;justify-content:center}
+        .tc-btn{display:inline-block;padding:.65rem 1rem;border-radius:10px;text-decoration:none}
+        .tc-primary{background:#3f51b5;color:#fff}
+        .tc-ghost{border:1px solid #dcdce7}
+      </style>
+    </head>
+    <body>
+      <div class="tc-verify-wrap">
+        <h1><?php echo $res['ok'] ? 'Check your inbox' : 'Resend verification'; ?></h1>
+        <p class="<?php echo $res['ok'] ? 'tc-ok' : 'tc-bad'; ?>"><?php echo esc_html($res['msg']); ?></p>
+        <div class="tc-actions">
+          <a class="tc-btn tc-primary" href="<?php echo esc_url( TC_PRO_LOGIN_PAGE ); ?>">Go to Login</a>
+        </div>
+      </div>
+      <?php wp_footer(); ?>
+    </body>
+    </html>
+    <?php
+    exit;
+  }
+
+  // Verification landing (Pros)
+  if (isset($_GET['tc_verify_pro'])) {
+    $pid   = absint($_GET['pid'] ?? 0);
+    $token = sanitize_text_field($_GET['token'] ?? '');
+
+    status_header(200);
+    nocache_headers();
+
+    global $wpdb;
+    $verify_tbl = tc_pro_verify_table();
+    $ok = false;
+    if ($pid && $token) {
+      $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM `$verify_tbl` WHERE ProfessionalID=%d", $pid));
+      if ($row && hash_equals($row->Token, $token) && (int)$row->Verified === 0) {
+        $wpdb->update($verify_tbl, ['Verified' => 1], ['ProfessionalID' => $pid], ['%d'], ['%d']);
+        $ok = true;
+
+        $wp_users = get_users([
+          'meta_key'   => 'tc_linked_professional_id',
+          'meta_value' => $pid,
+          'fields'     => 'ID',
+        ]);
+        foreach ($wp_users as $uid) {
+          update_user_meta($uid, 'tc_email_verified', 1);
+        }
+      }
+    }
+
+    ?>
+    <!doctype html>
+    <html <?php language_attributes(); ?>>
+    <head>
+      <meta charset="<?php bloginfo('charset'); ?>">
+      <meta name="viewport" content="width=device-width, initial-scale=1" />
+      <title><?php echo $ok ? 'Email verified' : 'Verification failed'; ?></title>
+      <?php wp_head(); ?>
+      <style>
+        .tc-verify-wrap{max-width:640px;margin:8rem auto;padding:2rem;border-radius:14px;background:#fff;box-shadow:0 10px 30px rgba(0,0,0,.08);font-family:system-ui,-apple-system,Segoe UI,Roboto;text-align:center}
+        .tc-verify-wrap h1{margin:0 0 .5rem;font-size:1.5rem}
+        .tc-verify-wrap p{margin:0 0 1rem}
+        .tc-ok{color:#136f35}.tc-bad{color:#b71c1c}
+        .tc-actions{display:flex;gap:.6rem;flex-wrap:wrap;margin-top:8px;justify-content:center}
+        .tc-btn{display:inline-block;padding:.55rem .9rem;border-radius:8px;text-decoration:none}
+        .tc-primary{background:#3f51b5;color:#fff}
+        .tc-ghost{border:1px solid #dcdce7}
+        .tc-resend-box{margin-top:12px;padding:12px;border:1px solid #dcdce7;border-radius:10px;background:#fafbff;text-align:left}
+        .tc-resend-box label{display:block;margin-bottom:6px;font-weight:600}
+        .tc-resend-box input[type="email"]{width:100%;padding:.6rem;border:1px solid #dcdce7;border-radius:8px}
+        .tc-resend-box button{margin-top:8px;padding:.6rem 1rem;border-radius:8px;background:#3f51b5;color:#fff;border:none;cursor:pointer}
+      </style>
+    </head>
+    <body>
+      <div class="tc-verify-wrap">
+        <h1><?php echo $ok ? 'Email verified' : 'Verification failed'; ?></h1>
+        <?php if ($ok): ?>
+          <p class="tc-ok">Thanks! Your email has been confirmed. You can now log in.</p>
+          <div class="tc-actions">
+            <a class="tc-btn tc-primary" href="<?php echo esc_url( TC_PRO_LOGIN_PAGE ); ?>">Go to Login</a>
+          </div>
+          <script>setTimeout(function(){ window.location.href = "<?php echo esc_js( TC_PRO_LOGIN_PAGE ); ?>"; }, 2000);</script>
+        <?php else: ?>
+          <p class="tc-bad">The verification link is invalid or already used.</p>
+          <div class="tc-resend-box">
+            <form method="post" action="<?php echo esc_url( add_query_arg('tc_resend_pro_public','1', TC_PRO_LOGIN_PAGE) ); ?>">
+              <?php wp_nonce_field('tc_pro_public_resend'); ?>
+              <label for="resend_email">Didn’t get the email? Enter your address and we’ll resend it:</label>
+              <input type="email" id="resend_email" name="resend_email" placeholder="your@email.com" required>
+              <button type="submit">Resend verification email</button>
+            </form>
+          </div>
+          <div class="tc-actions" style="margin-top:12px;">
+            <a class="tc-btn tc-ghost" href="<?php echo esc_url( TC_PRO_LOGIN_PAGE ); ?>">Back to Login</a>
+          </div>
+        <?php endif; ?>
+      </div>
+      <?php wp_footer(); ?>
+    </body>
+    </html>
+    <?php
+    exit;
+  }
+});
+
+/* ==============================
+ * Block WP login until verified (Pros)
+ * ============================== */
+add_filter('authenticate', function ($user, $username, $password) {
+  if ($user instanceof WP_User) {
+    $is_pro_linked = (int) get_user_meta($user->ID, 'tc_linked_professional_id', true);
+    if ($is_pro_linked) {
+      $verified = get_user_meta($user->ID, 'tc_email_verified', true);
+      if ((string)$verified !== '1') {
+        $resend_url = add_query_arg([
+          'action'   => 'tc_resend_pro',
+          'login'    => rawurlencode($user->user_login),
+          '_wpnonce' => wp_create_nonce('tc_resend_pro_' . $user->user_login),
+        ], wp_login_url());
+        $msg = 'Please verify your email before logging in. ';
+        $msg .= '<a href="'.esc_url($resend_url).'">Resend verification email</a>';
+        return new WP_Error('tc_unverified_pro', $msg);
+      }
+    }
+  }
+  return $user;
+}, 5, 3);
+
+/* ==============================
+ * Login page action: RESEND (Pros)
+ * ============================== */
+add_action('login_form_tc_resend_pro', function () {
+  $login  = isset($_GET['login']) ? sanitize_user(wp_unslash($_GET['login'])) : '';
+  $nonce  = $_GET['_wpnonce'] ?? '';
+  if (!$login || !wp_verify_nonce($nonce, 'tc_resend_pro_' . $login)) {
+    wp_redirect( add_query_arg('verification', 'invalid', wp_login_url()) );
+    exit;
+  }
+
+  $user = get_user_by('login', $login);
+  if (!$user) {
+    wp_redirect( add_query_arg('verification', 'invalid', wp_login_url()) );
+    exit;
+  }
+
+  // Only Pros here
+  $pro_id = (int) get_user_meta($user->ID, 'tc_linked_professional_id', true);
+  if (!$pro_id) {
+    wp_redirect( add_query_arg('verification', 'invalid', wp_login_url()) );
+    exit;
+  }
+
+  // Rate limit: 10 minutes
+  $last = (int) get_user_meta($user->ID, 'tc_last_resend_at', true);
+  if ($last && (time() - $last) < 600) {
+    wp_redirect( add_query_arg('verification', 'rate', wp_login_url()) );
+    exit;
+  }
+
+  $email = $user->user_email;
+  if (!is_email($email)) {
+    wp_redirect( add_query_arg('verification', 'missing', wp_login_url()) );
+    exit;
+  }
+
+  // Generate fresh token + send
+  global $wpdb;
+  $verify_tbl = tc_pro_verify_table();
+  $token = wp_generate_password(32, false);
+  $wpdb->replace($verify_tbl, [
+    'ProfessionalID' => $pro_id,
+    'Token'          => $token,
+    'Verified'       => 0,
+  ], ['%d','%s','%d']);
+
+  $first = get_user_meta($user->ID, 'first_name', true);
+  tc_send_pro_verify_email($email, $first ?: $user->user_login, $pro_id, $token);
+  update_user_meta($user->ID, 'tc_last_resend_at', time());
+
+  wp_redirect( add_query_arg('verification', 'resent', wp_login_url()) );
+  exit;
+});
+
+/* ==============================
+ * Login page banners for resend states
+ * ============================== */
+add_filter('login_message', function ($message) {
+  if (!isset($_GET['verification'])) return $message;
+  $type = sanitize_text_field($_GET['verification']);
+  $out = '';
+  if ($type === 'resent') {
+    $out = '<div class="notice notice-success" style="margin:10px 0;padding:10px 12px;border-left:4px solid #46b450;background:#f1fff0;">We’ve sent a new verification link to your email.</div>';
+  } elseif ($type === 'rate') {
+    $out = '<div class="notice notice-warning" style="margin:10px 0;padding:10px 12px;border-left:4px solid #ffb900;background:#fff8e5;">Please wait a few minutes before requesting another verification email.</div>';
+  } elseif ($type === 'missing' || $type === 'invalid') {
+    $out = '<div class="notice notice-error" style="margin:10px 0;padding:10px 12px;border-left:4px solid #dc3232;background:#fff5f5;">We couldn’t resend the verification email. Please contact support.</div>';
+  }
+  return $out . $message;
+}, 10, 1);
+
+/* ==============================
+ * Shortcode: [professional_form]
+ * Mirrors Client layout; adds consent checkbox
+ * ============================== */
+function tc_professional_form_shortcode() {
+  ob_start(); ?>
+  <div class="form-container" style="max-width:720px;margin:0 auto;padding:24px 16px;text-align:center;">
+    <a href="<?php echo esc_url('https://theraconnect.net/'); ?>">
+      <img class="logo" src="https://theraconnect.net/wp-content/uploads/2025/06/LOGO-Thera-Connect-.png" alt="TheraConnect Logo" />
+    </a>
+
+    <style>
+      .form-container .logo{
+        display:block;margin:0 auto 12px;height:auto;width:auto;
+      }
+      .form-container .tc-btn-primary{
+        background-color:#B48395;color:#fff;padding:6px 12px;font-size:12.5px;border-radius:6px;border:none;line-height:1.15;display:inline-block;cursor:pointer;transition:background-color .2s ease;
+      }
+      .form-container .tc-btn-primary:hover{ background-color:#9e6d80; }
+      .form-container form{ max-width:520px; margin:0 auto; text-align:center; }
+      .form-container .form-row{ display:flex; gap:10px; flex-wrap:wrap; justify-content:center; }
+
+      .form-container input[type="text"],
+      .form-container input[type="email"],
+      .form-container input[type="tel"],
+      .form-container input[type="password"],
+      .form-container select{
+        width:100%; max-width:520px; height:44px !important; min-height:44px !important; padding:10px 12px !important; border:1px solid #ddd; border-radius:6px; font-size:16px; line-height:1.2; background:#fff; box-sizing:border-box; -webkit-appearance:none; appearance:none; text-align:left; margin-left:auto; margin-right:auto; display:block;
+      }
+      .form-container .checkbox{display:flex; gap:8px; align-items:flex-start; margin:8px 0; text-align:left;}
+      .form-container .small-hint{color:#666; font-size:.85rem; margin:6px 0 10px; text-align:center;}
+
+      @media (max-width:640px){
+        .form-container{ padding:16px 12px; }
+        .form-container .form-row input, .form-container .form-row select{
+          flex:1 1 100% !important; max-width:100% !important;
+        }
+      }
+    </style>
+
+    <form method="POST" action="<?php echo esc_url( add_query_arg('tc_pro_submit','1', home_url('/')) ); ?>">
+      <?php wp_nonce_field('save_professional_nonce','_wpnonce'); ?>
+
+      <input type="text" name="companyName" placeholder="Company Name" />
+      <input type="text" name="dba" placeholder="Doing Business As" />
+
+      <div class="form-row">
+        <input style="flex:1 1 240px" type="text" name="firstName" placeholder="First Name" required />
+        <input style="flex:1 1 240px" type="text" name="lastName" placeholder="Last Name" required />
+      </div>
+
+      <input type="text" name="title" placeholder="Title" />
+      <input type="text" name="npi" placeholder="NPI (optional)" />
+
+      <div class="form-row">
+        <input style="flex:1 1 240px" type="tel" name="mobilePhone" placeholder="Mobile Phone" />
+        <input style="flex:1 1 240px" type="tel" name="phone" placeholder="Phone" />
+      </div>
+
+      <input type="email" name="email" placeholder="Email Address" required />
+
+      <input type="text" name="street" placeholder="Street Address" />
+      <div class="form-row">
+        <input style="flex:1 1 200px" type="text" name="city" placeholder="City" />
+        <select style="flex:1 1 160px" name="state">
+          <option value="">State/Province</option>
+          <?php
+            $states = ['AL','AK','AZ','AR','CA','CO','CT','DE','FL','GA','HI','ID','IL','IN','IA','KS','KY','LA','ME','MD','MA','MI','MN','MS','MO','MT','NE','NV','NH','NJ','NM','NY','NC','ND','OH','OK','OR','PA','RI','SC','SD','TN','TX','UT','VT','VA','WA','WV','WI','WY','DC','Other'];
+            foreach ($states as $st) echo '<option value="'.esc_attr($st).'">'.esc_html($st).'</option>';
+          ?>
+        </select>
+        <input style="flex:1 1 140px" type="text" name="zip" placeholder="Postal/Zip Code" />
+      </div>
+
+      <select name="country">
+        <option value="">Country</option>
+        <option value="United States">United States</option>
+        <option value="Canada">Canada</option>
+        <option value="United Kingdom">United Kingdom</option>
+        <option value="Australia">Australia</option>
+        <option value="India">India</option>
+        <option value="Philippines">Philippines</option>
+        <option value="Germany">Germany</option>
+        <option value="France">France</option>
+        <option value="Mexico">Mexico</option>
+        <option value="Brazil">Brazil</option>
+        <option value="South Africa">South Africa</option>
+        <option value="Japan">Japan</option>
+        <option value="China">China</option>
+        <option value="Other">Other</option>
+      </select>
+
+      <select name="visitType" required>
+        <option value="">Preferred Type of Visit</option>
+        <option value="virtual">Virtual</option>
+        <option value="in-person">In-Person</option>
+        <option value="either">Either</option>
+      </select>
+
+      <select name="insuranceRequired">
+        <option value="">Insurance Required?</option>
+        <option value="Yes">Yes</option>
+        <option value="No">No</option>
+      </select>
+
+      <!-- Password + Confirm (required) -->
+      <input type="password" name="pro_password" placeholder="Create a password (min 8 chars)" minlength="8" required />
+      <input type="password" name="pro_password_confirm" placeholder="Confirm password" minlength="8" />
+
+      <!-- Consent checkbox (required, mirrors Clients) -->
+      <label class="checkbox">
+        <input type="checkbox" name="consent" value="Yes" required />
+        <span>By submitting, you agree to share your info with TheraConnect’s healthcare professional network.</span>
+      </label>
+
+      <div class="small-hint">You’ll need to verify your email before logging in.</div>
+      <button type="submit" class="tc-btn-primary">Register</button>
+    </form>
+  </div>
+  <?php
+  return ob_get_clean();
+}
+add_shortcode('professional_form', 'tc_professional_form_shortcode');
+
+/* ==============================
+ * Admin: Pros list page (search, filters, export)
+ * ============================== */
+add_action('admin_menu', function () {
+  add_menu_page(
+    'TheraConnect Pros',
+    'TheraConnect Pros',
+    'list_users',
+    'tc-pros',
+    'tc_render_pros_page',
+    'dashicons-groups',
+    58
+  );
+  add_submenu_page(
+    'tc-pros',
+    'Professionals',
+    'Professionals',
+    'list_users',
+    'tc-pros',
+    'tc_render_pros_page'
+  );
+});
+
+function tc_render_pros_page() {
+  if (!current_user_can('list_users')) {
+    wp_die('You do not have sufficient permissions to access this page.');
+  }
+
+  global $wpdb;
+  $users_tbl  = TC_USERS_TABLE;
+  $verify_tbl = tc_pro_verify_table();
+
+  // Params
+  $per_page = max(5, min(100, intval($_GET['per_page'] ?? 20)));
+  $paged    = max(1, intval($_GET['paged'] ?? 1));
+  $search   = trim(sanitize_text_field($_GET['s'] ?? ''));
+  $vfilter  = sanitize_text_field($_GET['verified'] ?? ''); // '', '1', '0'
+
+  // Export CSV
+  if (isset($_GET['tc_export']) && $_GET['tc_export'] === '1' && check_admin_referer('tc_export_nonce')) {
+    $where = "WHERE u.UserType='Professional'";
+    $args  = [];
+    if ($search !== '') {
+      $where .= " AND (u.Email LIKE %s OR u.FirstName LIKE %s OR u.LastName LIKE %s OR u.CompanyName LIKE %s)";
+      $q = '%' . $wpdb->esc_like($search) . '%';
+      $args = array_merge($args, [$q,$q,$q,$q]);
+    }
+    if ($vfilter === '1' || $vfilter === '0') {
+      $where .= " AND IFNULL(v.Verified,0)=" . intval($vfilter);
+    }
+
+    $sql = "SELECT 
+              u.UserID, u.FirstName, u.LastName, u.Email, u.CompanyName, u.Title, u.NPI,
+              u.MobilePhone, u.Phone, u.City, u.StateProvince, u.Country,
+              u.PreferredVisitType, u.InsuranceRequired, u.CreatedAt,
+              IFNULL(v.Verified,0) as Verified
+            FROM `$users_tbl` u
+            LEFT JOIN `$verify_tbl` v ON v.ProfessionalID=u.UserID
+            $where
+            ORDER BY u.CreatedAt DESC";
+    $rows = $wpdb->get_results($wpdb->prepare($sql, $args), ARRAY_A);
+
+    header('Content-Type: text/csv; charset=utf-8');
+    header('Content-Disposition: attachment; filename=theraconnect_professionals.csv');
+    $out = fopen('php://output', 'w');
+    fputcsv($out, array_keys($rows ? $rows[0] : [
+      'UserID','FirstName','LastName','Email','CompanyName','Title','NPI','MobilePhone','Phone','City','StateProvince','Country','PreferredVisitType','InsuranceRequired','CreatedAt','Verified'
+    ]));
+    foreach ($rows as $r) fputcsv($out, $r);
+    fclose($out);
+    exit;
+  }
+
+  // Build WHERE for list view
+  $where = "WHERE u.UserType='Professional'";
+  $args  = [];
+  if ($search !== '') {
+    $where .= " AND (u.Email LIKE %s OR u.FirstName LIKE %s OR u.LastName LIKE %s OR u.CompanyName LIKE %s)";
+    $q = '%' . $wpdb->esc_like($search) . '%';
+    $args = array_merge($args, [$q,$q,$q,$q]);
+  }
+  if ($vfilter === '1' || $vfilter === '0') {
+    $where .= " AND IFNULL(v.Verified,0)=" . intval($vfilter);
+  }
+
+  // Count
+  $count_sql = "SELECT COUNT(*) 
+                FROM `$users_tbl` u
+                LEFT JOIN `$verify_tbl` v ON v.ProfessionalID=u.UserID
+                $where";
+  $total = (int)$wpdb->get_var($wpdb->prepare($count_sql, $args));
+
+  // Page rows
+  $offset = ($paged - 1) * $per_page;
+  $sql = "SELECT 
+            u.UserID, u.FirstName, u.LastName, u.Email, u.CompanyName, u.Title, u.NPI,
+            u.City, u.StateProvince, u.Country, u.PreferredVisitType, u.InsuranceRequired,
+            u.CreatedAt,
+            IFNULL(v.Verified,0) as Verified
+          FROM `$users_tbl` u
+          LEFT JOIN `$verify_tbl` v ON v.ProfessionalID=u.UserID
+          $where
+          ORDER BY u.CreatedAt DESC
+          LIMIT %d OFFSET %d";
+  $args_paged = $args;
+  $args_paged[] = $per_page;
+  $args_paged[] = $offset;
+  $rows = $wpdb->get_results($wpdb->prepare($sql, $args_paged));
+
+  // Build base URL (preserve filters)
+  $base = menu_page_url('tc-pros', false);
+  $qs   = [];
+  if ($search !== '') $qs['s'] = $search;
+  if ($vfilter !== '') $qs['verified'] = $vfilter;
+  if ($per_page !== 20) $qs['per_page'] = $per_page;
+
+  // Pagination
+  $total_pages = max(1, ceil($total / $per_page));
+  $export_url  = wp_nonce_url(add_query_arg(array_merge($qs, ['tc_export' => '1']), $base), 'tc_export_nonce');
+
+  ?>
+  <div class="wrap">
+    <h1>Professionals</h1>
+
+    <form method="get" style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <input type="hidden" name="page" value="tc-pros" />
+      <input type="search" name="s" value="<?php echo esc_attr($search); ?>" placeholder="Search name, email, company…" class="regular-text" />
+      <select name="verified">
+        <option value="">Any status</option>
+        <option value="1" <?php selected($vfilter,'1'); ?>>Verified</option>
+        <option value="0" <?php selected($vfilter,'0'); ?>>Unverified</option>
+      </select>
+      <select name="per_page">
+        <?php foreach ([10,20,50,100] as $n): ?>
+          <option value="<?php echo $n; ?>" <?php selected($per_page,$n); ?>><?php echo $n; ?>/page</option>
+        <?php endforeach; ?>
+      </select>
+      <button class="button">Filter</button>
+      <a class="button button-primary" href="<?php echo esc_url($export_url); ?>">Export CSV</a>
+    </form>
+
+    <p style="margin-top:6px;color:#666">Total: <?php echo (int)$total; ?> professionals</p>
+
+    <table class="wp-list-table widefat fixed striped" style="margin-top:12px">
+      <thead>
+      <tr>
+        <th width="70">ID</th>
+        <th>Name</th>
+        <th>Email</th>
+        <th>Company / Title</th>
+        <th>City/State</th>
+        <th>Visit Type</th>
+        <th>Insurance</th>
+        <th>Verified</th>
+        <th>Created</th>
+      </tr>
+      </thead>
+      <tbody>
+      <?php if ($rows): foreach ($rows as $r): ?>
+        <tr>
+          <td><?php echo (int)$r->UserID; ?></td>
+          <td><?php echo esc_html(trim($r->FirstName.' '.$r->LastName)); ?></td>
+          <td><a href="mailto:<?php echo esc_attr($r->Email); ?>"><?php echo esc_html($r->Email); ?></a></td>
+          <td><?php echo esc_html(trim(($r->CompanyName?:'') . (($r->Title)? ' — '.$r->Title : ''))); ?></td>
+          <td><?php echo esc_html(trim(($r->City?:'') . (($r->StateProvince)? ', '.$r->StateProvince : ''))); ?></td>
+          <td><?php echo esc_html($r->PreferredVisitType ?: '—'); ?></td>
+          <td><?php echo ($r->InsuranceRequired===null ? '—' : ($r->InsuranceRequired ? 'Yes' : 'No')); ?></td>
+          <td><?php echo $r->Verified ? '<span style="color:#136f35;font-weight:600">Yes</span>' : '<span style="color:#b71c1c">No</span>'; ?></td>
+          <td><?php echo esc_html( mysql2date('Y-m-d H:i', $r->CreatedAt) ); ?></td>
+        </tr>
+      <?php endforeach; else: ?>
+        <tr><td colspan="9">No professionals found.</td></tr>
+      <?php endif; ?>
+      </tbody>
+    </table>
+
+    <?php if ($total_pages > 1):
+      $qs_page = $qs; ?>
+      <div class="tablenav-pages" style="margin-top:12px">
+        <span class="displaying-num"><?php echo (int)$total; ?> items</span>
+        <span class="pagination-links">
+          <?php
+          $qs_page['paged'] = 1;
+          $first = add_query_arg($qs_page, $base);
+          $qs_page['paged'] = max(1, $paged-1);
+          $prev  = add_query_arg($qs_page, $base);
+          $qs_page['paged'] = min($total_pages, $paged+1);
+          $next  = add_query_arg($qs_page, $base);
+          $qs_page['paged'] = $total_pages;
+          $last  = add_query_arg($qs_page, $base);
+          ?>
+          <a class="first-page button <?php disabled($paged,1); ?>" href="<?php echo esc_url($first); ?>">&laquo;</a>
+          <a class="prev-page button <?php disabled($paged,1); ?>" href="<?php echo esc_url($prev); ?>">&lsaquo;</a>
+          <span class="paging-input">
+            <input class="current-page" type="text" name="paged" value="<?php echo (int)$paged; ?>" size="2" />
+            <span class="tablenav-paging-text"> of <span class="total-pages"><?php echo (int)$total_pages; ?></span></span>
+          </span>
+          <a class="next-page button <?php disabled($paged,$total_pages); ?>" href="<?php echo esc_url($next); ?>">&rsaquo;</a>
+          <a class="last-page button <?php disabled($paged,$total_pages); ?>" href="<?php echo esc_url($last); ?>">&raquo;</a>
+        </span>
+      </div>
+    <?php endif; ?>
+  </div>
+  <?php
+}
+
+/* ==============================
+ * Dashboard widget: Pros stats
+ * ============================== */
+add_action('wp_dashboard_setup', function () {
+  if (!current_user_can('list_users')) return;
+  wp_add_dashboard_widget('tc_pros_widget', 'TheraConnect Pros — Snapshot', 'tc_render_pros_widget');
+});
+
+function tc_render_pros_widget() {
+  global $wpdb;
+  $users_tbl  = TC_USERS_TABLE;
+  $verify_tbl = tc_pro_verify_table();
+
+  $total = (int)$wpdb->get_var($wpdb->prepare(
+    "SELECT COUNT(*) FROM `$users_tbl` WHERE UserType=%s", 'Professional'
+  ));
+  $verified = (int)$wpdb->get_var(
+    "SELECT COUNT(*) FROM `$users_tbl` u
+     INNER JOIN `$verify_tbl` v ON v.ProfessionalID=u.UserID AND v.Verified=1
+     WHERE u.UserType='Professional'"
+  );
+  $unverified = max(0, $total - $verified);
+
+  $recent = $wpdb->get_results(
+    "SELECT u.UserID, u.FirstName, u.LastName, u.Email, u.CreatedAt
+     FROM `$users_tbl` u
+     WHERE u.UserType='Professional'
+     ORDER BY u.CreatedAt DESC
+     LIMIT 5"
+  );
+
+  $admin_list_url = menu_page_url('tc-pros', false);
+  ?>
+  <div style="display:flex; gap:14px; flex-wrap:wrap">
+    <div style="flex:1 1 120px; background:#fff; border:1px solid #e6e6ef; border-radius:8px; padding:10px 12px">
+      <div style="font-size:12px;color:#666">Total</div>
+      <div style="font-size:20px;font-weight:700"><?php echo (int)$total; ?></div>
+    </div>
+    <div style="flex:1 1 120px; background:#fff; border:1px solid #e6e6ef; border-radius:8px; padding:10px 12px">
+      <div style="font-size:12px;color:#666">Verified</div>
+      <div style="font-size:20px;font-weight:700;color:#136f35"><?php echo (int)$verified; ?></div>
+    </div>
+    <div style="flex:1 1 120px; background:#fff; border:1px solid #e6e6ef; border-radius:8px; padding:10px 12px">
+      <div style="font-size:12px;color:#666">Unverified</div>
+      <div style="font-size:20px;font-weight:700;color:#b71c1c"><?php echo (int)$unverified; ?></div>
+    </div>
+  </div>
+
+  <h4 style="margin:12px 0 8px">Recent registrations</h4>
+  <ul>
+    <?php if ($recent): foreach ($recent as $r): ?>
+      <li>
+        <strong><?php echo esc_html(trim($r->FirstName.' '.$r->LastName)); ?></strong>
+        &lt;<a href="mailto:<?php echo esc_attr($r->Email); ?>"><?php echo esc_html($r->Email); ?></a>&gt;
+        — <?php echo esc_html( mysql2date('Y-m-d H:i', $r->CreatedAt) ); ?>
+      </li>
+    <?php endforeach; else: ?>
+      <li>No recent registrations.</li>
+    <?php endif; ?>
+  </ul>
+
+  <p><a class="button button-primary" href="<?php echo esc_url($admin_list_url); ?>">View all Professionals</a></p>
+  <?php
+}
