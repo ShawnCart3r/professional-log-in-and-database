@@ -1,52 +1,105 @@
-WordPress Professional Registration & Verification System
+TheraConnect – Professional Registration & Verification System
 
-A complete user registration and email verification system for healthcare professionals, built as a custom WordPress plugin.
+A full-featured WordPress plugin that provides secure registration, email verification, and admin management tools for healthcare professionals.
+Built for real-world onboarding workflows, with an emphasis on security, data integrity, and user experience.
 
-Features
+🚀 Overview
 
-- Custom database architecture with proper indexing and table relationships
-- Email verification flow with secure token generation and expiration handling
-- Dual verification paths: login-based resend and public resend options
-- Rate limiting to prevent abuse (10-minute cooldown on resend requests)
-- WordPress authentication integration that blocks login until email is verified
-- Admin dashboard with search, filtering, pagination, and CSV export
-- Real-time dashboard widget showing registration stats and recent signups
-- Secure by design: nonces, prepared statements, input sanitization throughout
-- Smart duplicate handling for edge cases (existing emails, multiple registrations)
+This plugin implements a complete lifecycle for professional user registration and verification — from public signup to administrative reporting — all within WordPress.
+It’s designed to be maintainable, secure, and scalable while integrating seamlessly with existing authentication systems.
 
-Technical Stack
+🧩 Core Features
 
-- PHP 7.4+
-- WordPress 5.8+
-- MySQL with custom tables
-- AJAX for seamless user experience
-- WordPress authentication hooks
+Custom Database Architecture
+Dedicated tc_users and tc_email_verify_pro tables with proper indexing, relationships, and self-healing schema logic.
 
-What I Built
+Email Verification Workflow
+Secure token generation and validation using HMAC hashing.
+Verification links expire automatically once used.
 
-This plugin handles the complete lifecycle of professional user registration:
-1. Public registration form with validation
-2. Custom Users table insertion with proper data normalization
-3. WordPress user account creation with role assignment
-4. Email verification token generation and delivery
-5. Verification landing page with success/failure states
-6. Login blocking until verification complete
-7. Admin tools for user management and reporting
+Dual Verification Paths
 
-Key Challenges Solved
+Login-based Resend: for existing WP users who haven’t verified.
 
-- Duplicate email handling: Safe upsert logic that handles edge cases
-- Verification state management: Proper token lifecycle and cleanup
-- Rate limiting: Prevents spam while allowing legitimate resends
-- Security: Full nonce protection, SQL injection prevention, XSS mitigation
-- UX: Clear error messages, resend flows, auto-redirect after verification
+Public Resend: for users who registered but aren’t yet in the system.
 
-Admin Features
+Rate Limiting & Abuse Protection
+10-minute cooldown between resend attempts, with nonces and hidden honeypots to deter bots.
 
-- Searchable user list with real-time filtering
-- Verification status tracking
-- One-click CSV export for reporting
-- Dashboard snapshot widget with key metrics
-- Bulk operations support
+Login Enforcement
+WordPress authentication is blocked until the user’s email is verified.
 
-Built to handle real-world healthcare professional onboarding with HIPAA-aware data handling practices.
+Admin Dashboard
+Searchable, filterable, paginated professional list with bulk delete and CSV export.
+
+Dashboard Widget
+At-a-glance view of total, verified, and unverified users plus recent signups.
+
+Security by Design
+Nonces, prepared statements, output escaping, and strict sanitization across all inputs.
+Hashed verification tokens stored in the database (never plain text).
+
+Duplicate-Safe Registration
+Gracefully updates existing professional profiles when re-registered under the same email.
+
+⚙️ Technical Stack
+
+Language: PHP 7.4+
+
+Platform: WordPress 5.8+
+
+Database: MySQL (custom tables with schema validation)
+
+Frontend: Minimal HTML/CSS + native WordPress forms
+
+Integration: WordPress user authentication hooks & admin UI components
+
+🧠 What This Plugin Does
+
+Collects professional registration data via a secure public form
+
+Normalizes and stores data in a custom table
+
+Creates and links a WordPress user account
+
+Sends an email verification link using a hashed token
+
+Blocks unverified users from logging in
+
+Provides admin tools for listing, filtering, and exporting user data
+
+Displays key metrics via an admin dashboard widget
+
+🛠️ Key Engineering Challenges Solved
+Challenge	Solution
+Duplicate Email Conflicts	Safe upsert logic ensures data consistency without breaking unique constraints
+Token Lifecycle	HMAC-hashed token storage with single-use verification links
+Rate Limiting	WordPress transients to throttle resend requests per email
+Secure Data Flow	Nonces, prepared queries, sanitized inputs, and generic responses prevent enumeration
+UX Smoothness	Simple, mobile-friendly forms and clear messaging for all states (register, verify, resend)
+Database Integrity	Automatic schema creation and repair on activation or load
+🔐 Security and Compliance Notes
+
+Built with best-practice security for WordPress (nonces, sanitization, and limited capabilities).
+
+Handles sensitive but non-PHI data safely.
+
+HIPAA-aware, but not a certified HIPAA compliance solution.
+Full HIPAA compliance requires specialized hosting and a Business Associate Agreement (BAA).
+
+🧾 Admin Tools
+
+Search, filter, and paginate professionals
+
+Track verification status in real time
+
+Export professional data to CSV
+
+Perform bulk deletion safely (with nonce verification)
+
+View registration statistics via dashboard snapshot widget
+
+📦 Summary
+
+The TheraConnect Professional Registration & Verification System provides a secure, scalable, and intuitive workflow for onboarding healthcare professionals inside WordPress.
+It balances ease of use for admins and end users with strong security controls, built-in rate limiting, and verified access enforcement — ready for production environments that demand reliability and integrity.
